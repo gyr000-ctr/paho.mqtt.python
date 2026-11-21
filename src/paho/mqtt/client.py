@@ -250,6 +250,31 @@ class DisconnectFlags(NamedTuple):
     """
 
 
+class AuthResponse(NamedTuple):
+    """Return value of the `on_auth` callback.
+
+    Used to answer an AUTH packet received from the broker, either during the
+    initial connection handshake (enhanced authentication) or during a
+    re-authentication started by the broker after the connection was
+    established (MQTT v5.0 section 4.12).
+    """
+
+    continue_authentication: bool
+    """True to answer the broker with an AUTH packet carrying reason code 0x18
+    (Continue authentication); False to abort the authentication, in which
+    case the client sends a DISCONNECT packet with reason code 0x8C (Bad
+    authentication method) and closes the connection."""
+
+    authentication_data: bytes | bytearray | None = None
+    """Optional authentication data to send back to the broker in the
+    Authentication Data property (id 22) of the outgoing AUTH packet."""
+
+    properties: Properties | None = None
+    """Optional additional MQTT v5.0 properties for the outgoing AUTH packet
+    (for example User Property). If `authentication_data` is given it is
+    added automatically and must not also be set here."""
+
+
 CallbackOnConnect_v1_mqtt3 = Callable[["Client", Any, dict[str, Any], MQTTErrorCode], None]
 CallbackOnConnect_v1_mqtt5 = Callable[["Client", Any, dict[str, Any], ReasonCode, Union[Properties, None]], None]
 CallbackOnConnect_v1 = Union[CallbackOnConnect_v1_mqtt5, CallbackOnConnect_v1_mqtt3]
@@ -278,6 +303,7 @@ CallbackOnUnsubscribe_v1_mqtt5 = Callable[["Client", Any, int, Properties, Union
 CallbackOnUnsubscribe_v1 = Union[CallbackOnUnsubscribe_v1_mqtt3, CallbackOnUnsubscribe_v1_mqtt5]
 CallbackOnUnsubscribe_v2 = Callable[["Client", Any, int, list[ReasonCode], Union[Properties, None]], None]
 CallbackOnUnsubscribe = Union[CallbackOnUnsubscribe_v1, CallbackOnUnsubscribe_v2]
+CallbackOnAuth = Callable[["Client", Any, ReasonCode, Union[Properties, None]], Union[AuthResponse, bool, None]]
 
 # This is needed for typing because class Client redefined the name "socket"
 _socket = socket
@@ -376,6 +402,10 @@ def convert_disconnect_error_code_to_reason_code(rc: MQTTErrorCode) -> ReasonCod
         return ReasonCode(PacketTypes.DISCONNECT, "Unspecified error")
     if rc == MQTTErrorCode.MQTT_ERR_PROTOCOL:
         return ReasonCode(PacketTypes.DISCONNECT, "Protocol error")
+    if rc == MQTTErrorCode.MQTT_ERR_AUTH:
+        # Re-authentication was refused by the application (on_auth callback);
+        # the client aborts with DISCONNECT 0x8C (Bad authentication method).
+        return ReasonCode(PacketTypes.DISCONNECT, "Bad authentication method")
     return ReasonCode(PacketTypes.DISCONNECT, "Unspecified error")
 
 
@@ -855,6 +885,7 @@ class Client:
         self._on_publish: CallbackOnPublish | None = None
         self._on_unsubscribe: CallbackOnUnsubscribe | None = None
         self._on_disconnect: CallbackOnDisconnect | None = None
+        self._on_auth: CallbackOnAuth | None = None
         self._on_socket_open: CallbackOnSocket | None = None
         self._on_socket_close: CallbackOnSocket | None = None
         self._on_socket_register_write: CallbackOnSocket | None = None
@@ -863,6 +894,10 @@ class Client:
         self._websocket_extra_headers: WebSocketHeaders | None = None
         # for clean_start == MQTT_CLEAN_START_FIRST_ONLY
         self._mqttv5_first_connect = True
+        # Set while a DISCONNECT 0x8C queued after a failed authentication
+        # is waiting to be written, so the on_disconnect callback reports
+        # MQTT_ERR_AUTH instead of a normal disconnection.
+        self._auth_failed_pending = False
         self.suppress_exceptions = False # For callbacks
 
     def __del__(self) -> None:
@@ -2782,6 +2817,67 @@ class Client:
         return decorator
 
     @property
+    def on_auth(self) -> CallbackOnAuth | None:
+        """The callback called when the broker sends an AUTH packet.
+
+        This only happens with MQTT v5.0, either during enhanced
+        authentication of the initial connection (reason code 0x18
+        "Continue authentication") or when the broker starts a
+        re-authentication on an already established connection (reason code
+        0x19 "Re-authenticate").
+
+        Expected signature::
+
+            auth_callback(client, userdata, reason_code, properties) -> AuthResponse | bool | None
+
+        :param Client client: the client instance for this callback
+        :param userdata: the private user data as set in Client() or user_data_set()
+        :param ReasonCode reason_code: the reason code of the AUTH packet
+                          received from the broker.
+        :param Properties properties: the MQTT v5.0 properties received in the
+                          AUTH packet, or None when the packet carries no
+                          properties. The Authentication Method and
+                          Authentication Data properties (when present) are
+                          accessible on it.
+
+        The return value tells the client how to answer:
+
+        * `AuthResponse` (or True): continue the authentication. The client
+          sends an AUTH packet with reason code 0x18 (Continue
+          authentication), including the Authentication Data and other
+          properties provided in the `AuthResponse`.
+        * False or None: abort the authentication. The client sends a
+          DISCONNECT packet with reason code 0x8C (Bad authentication
+          method), closes the connection and reports `MQTT_ERR_AUTH` to the
+          `on_disconnect` callback.
+
+        If no `on_auth` callback is set, an AUTH packet received from the
+        broker is treated as an authentication failure: the client sends
+        DISCONNECT 0x8C and disconnects.
+
+        Exceptions raised by the callback are handled like other callbacks
+        (see ``suppress_exceptions``); when they propagate, the
+        authentication is aborted with DISCONNECT 0x8C.
+
+        Decorator: @client.auth_callback() (``client`` is the name of the
+            instance which this callback is being attached to)
+        """
+        return self._on_auth
+
+    @on_auth.setter
+    def on_auth(self, func: CallbackOnAuth | None) -> None:
+        with self._callback_mutex:
+            self._on_auth = func
+
+    def auth_callback(
+        self,
+    ) -> Callable[[CallbackOnAuth], CallbackOnAuth]:
+        def decorator(func: CallbackOnAuth) -> CallbackOnAuth:
+            self.on_auth = func
+            return func
+        return decorator
+
+    @property
     def on_socket_open(self) -> CallbackOnSocket | None:
         """The callback called just after the socket was opened.
 
@@ -3042,6 +3138,22 @@ class Client:
         rc: MQTTErrorCode,
     ) -> MQTTErrorCode:
         if rc:
+            if rc == MQTTErrorCode.MQTT_ERR_AUTH and self._auth_failed_pending:
+                # A failed authentication queued a DISCONNECT 0x8C: make sure
+                # it reaches the broker before the socket is closed. The
+                # on_disconnect callback is invoked from _packet_write() once
+                # the packet is actually sent.
+                write_rc = self.loop_write()
+                if write_rc == MQTTErrorCode.MQTT_ERR_AGAIN:
+                    # Socket buffer is full: give up on flushing, fall back to
+                    # closing the socket and report the failure directly.
+                    self._auth_failed_pending = False
+                elif write_rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+                    return write_rc
+                else:
+                    # DISCONNECT 0x8C was written and the socket is now closed.
+                    return rc
+
             self._sock_close()
 
             if self._state in (_ConnectionState.MQTT_CS_DISCONNECTING, _ConnectionState.MQTT_CS_DISCONNECTED):
@@ -3233,10 +3345,18 @@ class Client:
                         with self._msgtime_mutex:
                             self._last_msg_out = time_func()
 
-                        self._do_on_disconnect(
-                            packet_from_broker=False,
-                            v1_rc=MQTTErrorCode.MQTT_ERR_SUCCESS,
-                        )
+                        if self._auth_failed_pending:
+                            # DISCONNECT 0x8C sent after a failed authentication.
+                            self._auth_failed_pending = False
+                            self._do_on_disconnect(
+                                packet_from_broker=False,
+                                v1_rc=MQTTErrorCode.MQTT_ERR_AUTH,
+                            )
+                        else:
+                            self._do_on_disconnect(
+                                packet_from_broker=False,
+                                v1_rc=MQTTErrorCode.MQTT_ERR_SUCCESS,
+                            )
                         self._sock_close()
                         # Only change to disconnected if the disconnection was wanted
                         # by the client (== state was disconnecting). If the broker disconnected
@@ -3617,6 +3737,31 @@ class Client:
 
         return self._packet_queue(command, packet, 0, 0)
 
+    def _send_auth(
+        self,
+        reasoncode: ReasonCode,
+        properties: Properties | None = None,
+    ) -> MQTTErrorCode:
+        """Send an AUTH packet (MQTT v5.0 only)."""
+        remaining_length = 1  # reason code is mandatory in an AUTH packet
+
+        if properties is not None:
+            packed_props = properties.pack()
+            remaining_length += len(packed_props)
+        else:
+            packed_props = b""
+
+        command = AUTH
+        packet = bytearray()
+        packet.append(command)
+        self._pack_remaining_length(packet, remaining_length)
+        packet += reasoncode.pack()
+        packet += packed_props
+
+        self._easy_log(MQTT_LOG_DEBUG, "Sending AUTH reasonCode=%s properties=%s",
+                       reasoncode, properties)
+        return self._packet_queue(command, packet, 0, 0)
+
     def _send_subscribe(
         self,
         dup: int,
@@ -3825,6 +3970,8 @@ class Client:
         elif cmd == DISCONNECT and self._protocol == MQTTv5:  # only allowed in MQTT 5.0
             self._handle_disconnect()
             return MQTTErrorCode.MQTT_ERR_SUCCESS
+        elif cmd == AUTH and self._protocol == MQTTv5:  # AUTH packet only exists in MQTT 5.0
+            return self._handle_auth()
         else:
             # If we don't recognise the command, return an error straight away.
             self._easy_log(MQTT_LOG_ERR, "Error: Unrecognised command %s", cmd)
@@ -4050,6 +4197,98 @@ class Client:
             v1_rc=MQTTErrorCode.MQTT_ERR_SUCCESS,  # If reason is absent (remaining length < 1), it means normal disconnection
             reason=reasonCode,
             properties=properties,
+        )
+
+    def _abort_authentication(self) -> MQTTErrorCode:
+        """Refuse an ongoing authentication: send DISCONNECT with reason code
+        0x8C (Bad authentication method), close the connection and report
+        MQTT_ERR_AUTH through the normal disconnect path.
+        """
+        self._easy_log(MQTT_LOG_ERR, "Authentication aborted, sending DISCONNECT with reason code 0x8C")
+        reasoncode = ReasonCode(PacketTypes.DISCONNECT, identifier=0x8C)
+        rc = self._send_disconnect(reasoncode)
+        if rc != MQTTErrorCode.MQTT_ERR_SUCCESS:
+            return rc
+        # The DISCONNECT is queued. Once written, _packet_write() closes the
+        # socket; the flag makes that path report MQTT_ERR_AUTH to the
+        # on_disconnect callback instead of a normal disconnection.
+        self._auth_failed_pending = True
+        # This is a client-initiated termination, do not auto-reconnect.
+        self._state = _ConnectionState.MQTT_CS_DISCONNECTING
+        return MQTTErrorCode.MQTT_ERR_AUTH
+
+    def _handle_auth(self) -> MQTTErrorCode:
+        result = _packet.decode_auth(self._in_packet["command"], self._in_packet["packet"], self._protocol)
+        reasonCode, properties = result.reason, result.properties
+
+        self._easy_log(MQTT_LOG_DEBUG, "Received AUTH %s %s", reasonCode, properties)
+
+        # MQTT v5.0 [MQTT-3.15.1-1]/[MQTT-4.12.0-2]: the only reason codes
+        # allowed in an AUTH packet from the server are 0x18 (Continue
+        # authentication) and 0x19 (Re-authenticate). Anything else is a
+        # protocol error.
+        if reasonCode is None or reasonCode.value not in (0x18, 0x19):
+            self._easy_log(MQTT_LOG_ERR, "AUTH packet contains invalid reason code %s", reasonCode)
+            return MQTTErrorCode.MQTT_ERR_PROTOCOL
+
+        with self._callback_mutex:
+            on_auth = self.on_auth
+
+        if on_auth is None:
+            self._easy_log(MQTT_LOG_ERR, "Received AUTH packet but no on_auth callback is set")
+            return self._abort_authentication()
+
+        with self._in_callback_mutex:
+            try:
+                response = on_auth(self, self._userdata, reasonCode, properties)
+            except Exception as err:
+                self._easy_log(MQTT_LOG_ERR, 'Caught exception in on_auth: %s', err)
+                if not self.suppress_exceptions:
+                    raise
+                return self._abort_authentication()
+
+        continue_auth: bool
+        auth_data: bytes | bytearray | None = None
+        response_properties: Properties | None = None
+
+        if isinstance(response, AuthResponse):
+            continue_auth = response.continue_authentication
+            auth_data = response.authentication_data
+            response_properties = response.properties
+        elif isinstance(response, bool):
+            continue_auth = response
+        elif response is None:
+            continue_auth = False
+        else:
+            self._easy_log(MQTT_LOG_ERR, "on_auth returned an unsupported value: %r", response)
+            return self._abort_authentication()
+
+        if not continue_auth:
+            return self._abort_authentication()
+
+        auth_properties = Properties(PacketTypes.AUTH)
+        if response_properties is not None:
+            # Copy the user provided properties onto a fresh AUTH Properties
+            # object so the callback's object is never mutated.
+            for name in response_properties.names:
+                compressed_name = name.replace(' ', '')
+                if hasattr(response_properties, compressed_name):
+                    setattr(auth_properties, compressed_name,
+                            getattr(response_properties, compressed_name))
+        if (not hasattr(auth_properties, "AuthenticationMethod")
+                # Reuse the authentication method advertised in CONNECT, as
+                # required by MQTT v5.0 section 4.12 for re-authentication.
+                and self._connect_properties is not None
+                and hasattr(self._connect_properties, "AuthenticationMethod")):
+            auth_properties.AuthenticationMethod = \
+                self._connect_properties.AuthenticationMethod
+        if (auth_data is not None
+                and not hasattr(auth_properties, "AuthenticationData")):
+            auth_properties.AuthenticationData = auth_data
+
+        return self._send_auth(
+            ReasonCode(PacketTypes.AUTH, identifier=0x18),
+            auth_properties,
         )
 
     def _handle_suback(self) -> None:
